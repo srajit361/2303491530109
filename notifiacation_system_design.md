@@ -1,4 +1,4 @@
-# Notification System Design
+
 
 -----
 
@@ -485,3 +485,363 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER notification_count_trigger
 AFTER INSERT OR UPDATE OR DELETE ON notifications
 FOR EACH ROW EXECUTE FUNCTION update_notification_count();
+
+
+-----
+
+## Stage 3
+
+### Query Analysis
+
+*Original Query:*
+
+sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+
+
+### Is this query accurate?
+
+The query is logically correct — it fetches all unread notifications for a specific student ordered by creation time. However it is *severely slow* at scale (50,000 students, 5,000,000 notifications) because:
+
+1. *No index on studentID* — full table scan on 5M rows
+1. *No index on isRead* — cannot filter efficiently
+1. *SELECT ** — fetches all columns including large body text unnecessarily
+1. *No index on createdAt* — ORDER BY causes expensive filesort
+
+-----
+
+### Should we add indexes on every column?
+
+A developer suggested adding indexes on every column. *This is NOT effective.* Reasons:
+
+- Indexes on boolean columns like isRead (only 2 values) have very low cardinality and provide minimal benefit as standalone indexes
+- Too many indexes slow down INSERT, UPDATE, and DELETE operations significantly
+- Storage overhead increases
+- The query planner may ignore low-cardinality indexes anyway
+
+*Recommended approach:* Use a *composite index* on the columns used together in the WHERE clause.
+
+-----
+
+### Optimized Solution
+
+*Step 1 — Create composite index:*
+
+sql
+-- Composite index for the exact query pattern
+CREATE INDEX idx_notifications_student_unread_date
+ON notifications(studentID, isRead, createdAt ASC);
+
+
+*Step 2 — Rewrite query to select only needed columns:*
+
+sql
+SELECT id, title, body, type, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+
+
+*Likely computation cost improvement:*
+
+|Metric   |Before                   |After                 |
+|---------|-------------------------|----------------------|
+|Scan type|Full table scan (5M rows)|Index seek (~few rows)|
+|Sort     |Expensive filesort       |Index provides order  |
+|Cost     |O(n)                     |O(log n)              |
+
+-----
+
+### Find students who got a Placement notification in the last 7 days
+
+The notificationType column contains enum values: "Event", "Result", "Placement".
+
+sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+
+
+*With index for this query:*
+
+sql
+CREATE INDEX idx_notifications_type_date
+ON notifications(notificationType, createdAt DESC);
+
+
+-----
+
+## Stage 4
+
+### Problem
+
+Notifications are fetched on every page load for every student. With 50,000 students this overwhelms the DB causing slow response times and bad UX.
+
+### Solutions and Tradeoffs
+
+#### Solution 1 — Cursor-based Pagination (Recommended)
+
+Instead of OFFSET/LIMIT (which scans all previous rows), use the last seen id or createdAt as a cursor.
+
+sql
+-- First page
+SELECT id, title, body, type, is_read, created_at
+FROM notifications
+WHERE user_id = $1
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- Next page (cursor = last createdAt from previous result)
+SELECT id, title, body, type, is_read, created_at
+FROM notifications
+WHERE user_id = $1 AND created_at < $2
+ORDER BY created_at DESC
+LIMIT 20;
+
+
+*Tradeoff:* Cannot jump to arbitrary pages, but extremely fast at scale.
+
+#### Solution 2 — Redis Caching
+
+Cache the first page of notifications per user in Redis with a TTL of 60 seconds.
+
+
+GET notifications:user:{userId}:page:1  → return cached
+MISS → query DB → store in Redis → return
+
+
+*Tradeoff:* Slight staleness (up to 60s), but reduces DB load by ~90%.
+
+#### Solution 3 — Lazy Loading + Infinite Scroll
+
+Only fetch notifications when the user scrolls, not on every page load. Combine with cursor pagination.
+
+*Tradeoff:* Better UX, reduces unnecessary fetches for users who never open the notification panel.
+
+#### Solution 4 — Unread Count Cache
+
+Instead of counting unread notifications on every page load, maintain a notification_counts table (as designed in Stage 2) updated via DB triggers.
+
+sql
+SELECT unread_count FROM notification_counts WHERE user_id = $1;
+
+
+This is O(1) instead of O(n).
+
+### Recommended Combined Strategy
+
+1. Cursor-based pagination for fetching notifications
+1. Redis cache for first page (most viewed)
+1. Unread count from counter cache table
+1. Lazy load on scroll, not on page load
+
+-----
+
+## Stage 5
+
+### Original Pseudocode Problem
+
+
+function notify_all(student_ids: array, message: string):
+  for student_id in student_ids:
+    send_email(student_id, message)   # calls Email API
+    save_to_db(student_id, message)   # DB Insert
+    push_to_app(student_id, message)  # real-time notification
+
+
+### Shortcomings
+
+1. *Sequential processing* — 50,000 students processed one by one. At even 100ms per student = 5,000 seconds (~83 minutes). Completely unacceptable.
+1. *No error handling* — if send_email fails at student 200, the entire loop crashes. 49,800 students never notified.
+1. *Tight coupling* — email send and DB save happen together. If email API is slow, DB inserts are blocked.
+1. *No retry mechanism* — failed emails are silently dropped.
+1. *No atomicity* — DB save and email send can get out of sync.
+
+### Should DB save and email send happen together?
+
+*No.* They should be decoupled because:
+
+- Email API is an external service (slow, can fail)
+- DB insert is fast and should always succeed first
+- Email delivery can be retried independently without re-inserting to DB
+
+### Revised Pseudocode (Reliable + Fast)
+
+typescript
+async function notify_all(student_ids: string[], message: string): Promise<void> {
+  // Step 1: Save ALL notifications to DB in bulk (fast, atomic)
+  await bulk_save_to_db(student_ids, message);
+
+  // Step 2: Push to app via WebSocket for online users (non-blocking)
+  await push_to_app_bulk(student_ids, message);
+
+  // Step 3: Queue emails in batches (don't call email API directly)
+  const BATCH_SIZE = 500;
+  for (let i = 0; i < student_ids.length; i += BATCH_SIZE) {
+    const batch = student_ids.slice(i, i + BATCH_SIZE);
+    await email_queue.addBulk(
+      batch.map(id => ({
+        data: { student_id: id, message },
+        opts: { attempts: 3, backoff: 5000 } // retry 3 times
+      }))
+    );
+  }
+}
+
+// Bulk DB insert (single query)
+async function bulk_save_to_db(student_ids: string[], message: string): Promise<void> {
+  const values = student_ids.map(id => `('${id}', '${message}', NOW())`).join(',');
+  await db.query(`
+    INSERT INTO notifications (user_id, body, created_at)
+    VALUES ${values}
+  `);
+}
+
+// Background worker processes email queue
+email_queue.process(async (job) => {
+  const { student_id, message } = job.data;
+  try {
+    await send_email(student_id, message);
+    await log('backend', 'info', 'service', `Email sent to ${student_id}`);
+  } catch (err) {
+    await log('backend', 'error', 'service', `Email failed for ${student_id}: ${err.message}`);
+    throw err; // triggers retry
+  }
+});
+
+
+### Key Improvements
+
+|Issue            |Fix                                |
+|-----------------|-----------------------------------|
+|Sequential       |Bulk DB insert + batched queue     |
+|No error handling|Try/catch + retry with backoff     |
+|Tight coupling   |DB save first, email via queue     |
+|No retry         |BullMQ with 3 retries + 5s backoff |
+|Slow             |Parallel processing via worker pool|
+
+-----
+
+## Stage 6
+
+### Priority Inbox Design
+
+*Priority rule:* placement > result > event, combined with recency.
+
+*Notification API:* GET http://4.224.186.213/evaluation-service/notifications
+
+### Priority Score Formula
+
+
+score = type_weight * 1000 + recency_score
+
+
+Where:
+
+- placement = weight 3
+- result = weight 2
+- event = weight 1
+- recency_score = milliseconds since epoch (newer = higher)
+
+### Implementation: src/priorityInbox.ts
+
+typescript
+import axios from "axios";
+import dotenv from "dotenv";
+import { log } from "./logger";
+
+dotenv.config();
+
+interface Notification {
+  id: string;
+  title: string;
+  body: string;
+  notificationType: "Placement" | "Result" | "Event";
+  isRead: boolean;
+  createdAt: string;
+  priorityScore?: number;
+}
+
+const TYPE_WEIGHT: Record<string, number> = {
+  Placement: 3,
+  Result: 2,
+  Event: 1,
+};
+
+function calculatePriorityScore(notification: Notification): number {
+  const typeWeight = TYPE_WEIGHT[notification.notificationType] || 1;
+  const recencyScore = new Date(notification.createdAt).getTime() / 1e10;
+  return typeWeight * 1000 + recencyScore;
+}
+
+async function getPriorityInbox(topN: number = 10): Promise<void> {
+  await log("backend", "info", "service", `Fetching priority inbox, top ${topN}`);
+
+  try {
+    const response = await axios.get(
+      "http://4.224.186.213/evaluation-service/notifications",
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.LOG_API_TOKEN}`,
+        },
+      }
+    );
+
+    const notifications: Notification[] = response.data;
+
+    // Filter unread only
+    const unread = notifications.filter((n) => !n.isRead);
+
+    // Calculate priority scores
+    const scored = unread.map((n) => ({
+      ...n,
+      priorityScore: calculatePriorityScore(n),
+    }));
+
+    // Sort by priority score descending
+    scored.sort((a, b) => (b.priorityScore ?? 0) - (a.priorityScore ?? 0));
+
+    // Take top N
+    const topNotifications = scored.slice(0, topN);
+
+    await log("backend", "info", "service", `Priority inbox built with ${topNotifications.length} notifications`);
+
+    console.log(`\n===== PRIORITY INBOX (Top ${topN}) =====\n`);
+    topNotifications.forEach((n, i) => {
+      console.log(`${i + 1}. [${n.notificationType.toUpperCase()}] ${n.title}`);
+      console.log(`   Score: ${n.priorityScore?.toFixed(2)} | Date: ${n.createdAt}`);
+      console.log(`   ${n.body}\n`);
+    });
+
+  } catch (err: any) {
+    await log("backend", "error", "service", `Failed to fetch notifications: ${err.message}`);
+  }
+}
+
+getPriorityInbox(10);
+
+
+### How to maintain top N efficiently as new notifications arrive
+
+Use a *Min-Heap of size N*:
+
+- Keep a min-heap of the top N notifications by priority score
+- When a new notification arrives via WebSocket, compare its score with the heap’s minimum
+- If higher, remove the minimum and insert the new one
+- This gives O(log N) insertion vs O(n log n) full re-sort
+
+For persistence, store the heap state in Redis as a sorted set:
+
+
+ZADD priority_inbox:{userId} {score} {notificationId}
+ZREVRANGE priority_inbox:{userId} 0 9  -- top 10
+
+
+-----
+
+## Stage 7
+
+(Please share the Stage 7 screenshot so I can complete this section accurately)
